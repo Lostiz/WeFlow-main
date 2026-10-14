@@ -1,0 +1,119 @@
+# WeFlow CI —— 依赖安装 / 代码检查 / 单元测试 / 生产构建
+#
+# 本文件的配置依据（均来自仓库实际内容，切勿凭空调整）：
+#   1. 技术栈：Electron + Vite + React 19 + TypeScript。渲染层在 src/，主进程与各 Worker 在 electron/。
+#   2. 包管理器：npm。仓库只提交了 package-lock.json，pnpm-lock.yaml 已被 .gitignore 忽略，因此统一用 npm ci。
+#   3. Node 版本：24。与既有 workflow 一致；scripts/check-wcdb-optional-exports.cjs 也是以 node24 为目标编译。
+#   4. 代码检查：仓库没有 ESLint / Prettier 配置，静态检查完全由 tsc 承担
+#      （npm run typecheck:renderer -> tsconfig.json，npm run typecheck:electron -> tsconfig.node.json）。
+#   5. 单元测试：npm run test:wcdb，用 node:test + esbuild 直接编译并驱动真实 TS 服务，
+#      不加载任何原生库、不读取真实数据，因此可在 CI 中安全运行。
+#   6. 安装依赖时一律追加 --ignore-scripts：package.json 的 postinstall 会执行
+#      patch-package、electron-builder install-app-deps（原生模块重建）并复制 Windows 运行时 DLL，
+#      这些都依赖本机编译工具链且 patches/ 目录不入库。跳过脚本后 tsc / vite build / node:test 均不受影响。
+#   7. 无需任何第三方可插拔组件（WCDB 动态库、解密插件、WeLive 可执行文件）即可完成全部检查与构建。
+
+name: CI
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+    branches: [main, master, dev]
+  workflow_dispatch:
+
+# 同一分支的重复推送只保留最新一次运行，避免排队浪费
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NODE_VERSION: "24"
+  # 所有 npm 安装命令共用的参数：跳过生命周期脚本 + 兼容 peer 依赖 + 关闭审计与赞助提示
+  NPM_CI_FLAGS: "--ignore-scripts --legacy-peer-deps --no-audit --no-fund"
+
+jobs:
+  # 任务一：代码检查 + 单元测试。先 install，再 renderer/electron 两次类型检查，最后跑 wcdb 契约测试。
+  quality:
+    name: Quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 项目同时支持 Windows / macOS / Linux，其中 Windows 有独立的路径与运行时分支，
+        # 因此至少在 ubuntu 与 windows 两套环境中各验证一次（与 wcdb-compatibility.yml 保持一致）。
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci ${{ env.NPM_CI_FLAGS }}
+
+      - name: Typecheck renderer (src/**, tsconfig.json)
+        run: npm run typecheck:renderer
+
+      - name: Typecheck electron (electron/**, vite.config.ts, tsconfig.node.json)
+        run: npm run typecheck:electron
+
+      - name: Unit test - WCDB provider contract (node:test)
+        run: npm run test:wcdb
+
+  # 任务二：生产构建。依赖任务一通过后再执行，产出 dist/（渲染层）与 dist-electron/（主进程与 Worker）。
+  # 这里只跑 vite build，不做 electron-builder 打包；安装包与发布由 release.yml / package.yml 负责。
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci ${{ env.NPM_CI_FLAGS }}
+
+      - name: Clean previous bundle output
+        run: node scripts/clean-dist-electron.cjs
+
+      - name: Build renderer and electron bundles
+        run: npx vite build
+
+      - name: Verify build output
+        shell: bash
+        run: |
+          set -euo pipefail
+          # package.json 的 main 指向 dist-electron/main.js，渲染层入口是 dist/index.html
+          test -f dist/index.html
+          test -f dist-electron/main.js
+          test -f dist-electron/preload.js
+
+      - name: Upload build output (linux only)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: weflow-build-linux
+          path: |
+            dist
+            dist-electron
+          retention-days: 7
+          if-no-files-found: error

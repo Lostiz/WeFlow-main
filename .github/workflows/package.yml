@@ -1,0 +1,149 @@
+# WeFlow 安装包打包校验（只打包，不发布）
+#
+# 与既有工作流的分工，避免重复触发：
+#   - release.yml         : push v* 标签时打包并发布到 GitHub Release（含 latest*.yml 注入、AUR 发布）
+#   - ci.yml              : push / PR 的代码检查与 vite 构建
+#   - 本文件               : 手动或主干分支上验证 electron-builder 三平台产物能否正常生成，产物只从 Artifacts 下载
+#
+# 关键前置事实：
+#   - 打包目标由 package.json 的 build 字段决定：Win(NSIS) / macOS(arm64 dmg+zip) / Linux(AppImage+tar.gz)。
+#   - Windows 安装包需要 resources/runtime/win32/*.dll（仓库已提交），Linux 需要 resources/installer/linux/install.sh。
+#   - 使用 npm ci --ignore-scripts 跳过 postinstall 的原生重建，并显式传 --config.npmRebuild=false，
+#     让 electron-builder 不再尝试用本机工具链重建原生模块（CI runner 无完整 MSVC/Python 环境）。
+#     因此产物仅用于验证打包链路，不作为对外发布件。
+#   - macOS 产物为未签名包（CSC_IDENTITY_AUTO_DISCOVERY=false）。
+
+name: Package (smoke)
+
+on:
+  workflow_dispatch:
+  push:
+    # 只在主干分支验证打包，feature 分支请用 workflow_dispatch 手动触发
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NODE_VERSION: "24"
+  NPM_CI_FLAGS: "--ignore-scripts --legacy-peer-deps --no-audit --no-fund"
+  ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+  CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+jobs:
+  windows-x64:
+    name: Windows x64 (NSIS)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci ${{ env.NPM_CI_FLAGS }}
+
+      - name: Clean previous bundle output
+        run: node scripts/clean-dist-electron.cjs
+
+      - name: Build renderer and electron bundles
+        run: npx vite build
+
+      - name: Package Windows x64 installer
+        run: npx electron-builder --win nsis --x64 --publish never --config.npmRebuild=false
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: weflow-windows-x64
+          path: |
+            release/*.exe
+            release/*.exe.blockmap
+            release/latest.yml
+          retention-days: 7
+          if-no-files-found: error
+
+  linux-x64:
+    name: Linux x64 (AppImage + tar.gz)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci ${{ env.NPM_CI_FLAGS }}
+
+      - name: Clean previous bundle output
+        run: node scripts/clean-dist-electron.cjs
+
+      - name: Build renderer and electron bundles
+        run: npx vite build
+
+      - name: Package Linux artifacts
+        run: npx electron-builder --linux --publish never --config.npmRebuild=false
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: weflow-linux-x64
+          path: |
+            release/*.AppImage
+            release/*.tar.gz
+            release/latest-linux.yml
+          retention-days: 7
+          if-no-files-found: error
+
+  macos-arm64:
+    name: macOS arm64 (dmg + zip, unsigned)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci ${{ env.NPM_CI_FLAGS }}
+
+      - name: Clean previous bundle output
+        run: node scripts/clean-dist-electron.cjs
+
+      - name: Build renderer and electron bundles
+        run: npx vite build
+
+      - name: Package macOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          # runner 上 hdiutil 偶发不稳定，DMG 失败时退化为只出 ZIP（与 release.yml 的策略一致）
+          if ! npx electron-builder --mac dmg zip --arm64 --publish never --config.npmRebuild=false; then
+            echo "::warning::DMG packaging failed; retrying with ZIP only."
+            npx electron-builder --mac zip --arm64 --publish never --config.npmRebuild=false
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: weflow-macos-arm64
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/latest-mac.yml
+            release/latest-arm64-mac.yml
+          retention-days: 7
+          if-no-files-found: warn
